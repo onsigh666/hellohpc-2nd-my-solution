@@ -1,5 +1,4 @@
 #include <iostream>
-#include <vector>
 
 #include "main.hpp"
 
@@ -9,22 +8,36 @@ thread_local uint32 seed32_1, seed32_2;
 // "已解决"标志。为空表示不叫停（单碰撞 CLI 路径就是这种情况）。
 thread_local const std::atomic<bool>* g_stop = nullptr;
 
+namespace {
+
+// 三张差分掩码表只取决于下标 k，与 IV、block 都无关，是纯常量。
+// 原来在 find_block0 里每次调用现分配现填(共 256 KB + 64K 次填表)，
+// 现在只在程序启动时构造一次。
+struct mask_tables {
+  uint32 q4[1 << 4];
+  uint32 q9q10[1 << 3];
+  uint32 q9[1 << 16];
+
+  mask_tables() {
+    for (unsigned k = 0; k < (1 << 4); ++k)
+      q4[k] = ((k << 2) ^ (k << 26)) & 0x38000004;
+    for (unsigned k = 0; k < (1 << 3); ++k)
+      q9q10[k] = ((k << 13) ^ (k << 4)) & 0x2060;
+    for (unsigned k = 0; k < (1 << 16); ++k)
+      q9[k] = ((k << 1) ^ (k << 2) ^ (k << 5) ^ (k << 7) ^ (k << 8) ^
+               (k << 10) ^ (k << 11) ^ (k << 13)) &
+              0x0eb94f16;
+  }
+};
+
+// 文件作用域静态对象：main 之前构造一次，之后全程只读。
+// 只读 => 所有搜索线程共享同一份，无数据竞争，也不需要加锁。
+const mask_tables g_masks;
+
+}  // namespace
+
 bool find_block0(uint32 block[], const uint32 IV[]) {
   uint32 Q[68] = {IV[0], IV[3], IV[2], IV[1]};
-
-  std::vector<uint32> q4mask(1 << 4);
-  for (unsigned k = 0; k < q4mask.size(); ++k)
-    q4mask[k] = ((k << 2) ^ (k << 26)) & 0x38000004;
-
-  std::vector<uint32> q9q10mask(1 << 3);
-  for (unsigned k = 0; k < q9q10mask.size(); ++k)
-    q9q10mask[k] = ((k << 13) ^ (k << 4)) & 0x2060;
-
-  std::vector<uint32> q9mask(1 << 16);
-  for (unsigned k = 0; k < q9mask.size(); ++k)
-    q9mask[k] = ((k << 1) ^ (k << 2) ^ (k << 5) ^ (k << 7) ^ (k << 8) ^
-                 (k << 10) ^ (k << 11) ^ (k << 13)) &
-                0x0eb94f16;
 
   while (true) {
     // 每轮外层循环查一次叫停开关。距上次检查最多隔一个 2^16 内层枚举
@@ -124,7 +137,7 @@ bool find_block0(uint32 block[], const uint32 IV[]) {
     // this changes m3, m4, m5 and m7
     unsigned counter2 = 0;
     while (counter2 < (1 << 4)) {
-      Q[Qoff + 4] = q4 ^ q4mask[counter2];
+      Q[Qoff + 4] = q4 ^ g_masks.q4[counter2];
       ++counter2;
       MD5_REVERSE_STEP(5, 0x4787c62a, 12);
       uint32 q21 = tt21 + block[5];
@@ -156,8 +169,8 @@ bool find_block0(uint32 block[], const uint32 IV[]) {
       // this changes m8, m9, m10, m12 and m13 (and not m11!)
       // the possible changes of q9 that also do not change m10 are used below
       for (unsigned counter3 = 0; counter3 < (1 << 3);) {
-        uint32 q10 = Q[Qoff + 10] ^ (q9q10mask[counter3] & 0x60);
-        Q[Qoff + 9] = q9backup ^ (q9q10mask[counter3] & 0x2000);
+        uint32 q10 = Q[Qoff + 10] ^ (g_masks.q9q10[counter3] & 0x60);
+        Q[Qoff + 9] = q9backup ^ (g_masks.q9q10[counter3] & 0x2000);
         ++counter3;
         uint32 m10 = RR(Q[Qoff + 11] - q10, 17);
         m10 -= FF(q10, Q[Qoff + 9], Q[Qoff + 8]) + tt10;
@@ -184,7 +197,7 @@ bool find_block0(uint32 block[], const uint32 IV[]) {
         // while keeping intact conditions on q1-q24
         // this changes m8, m9 and m12 (but not m10!)
         for (unsigned counter4 = 0; counter4 < (1 << 16); ++counter4) {
-          uint32 q9 = Q[Qoff + 9] ^ q9mask[counter4];
+          uint32 q9 = Q[Qoff + 9] ^ g_masks.q9[counter4];
           block[12] = tt12 - FF(Q[Qoff + 12], Q[Qoff + 11], q10) - q9;
           uint32 m8 = q9 - Q[Qoff + 8];
           block[8] = RR(m8, 7) - tt8;
