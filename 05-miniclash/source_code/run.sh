@@ -24,26 +24,23 @@ status=0
 n=0
 
 # Fields are space-separated: <input_file> <output_file1> <output_file2>.
-while read -r infile out1 out2 rest; do
-	# Skip blank lines.
-	[ -n "${infile:-}" ] || continue
+# 主路径：单进程多线程批量模式
+if "$BIN" --tasks "$TASKS" >/dev/null; then
+	n=$(awk 'NF { c++ } END { print c+0 }' "$TASKS")    # 非空行数
+	status=0
+else
+	# 降级路径：主路径整体失败就退回原来的逐个串行方式
+	echo "$0: bulk mode failed, falling back to serial" >&2
+	status=0
+	while read -r infile out1 out2 rest; do
+		[ -n "${infile:-}" ] || continue
+		if ! "$BIN" -q -p "$infile" -o "$out1" "$out2" >/dev/null; then
+			echo "$0: failed on $infile" >&2
+			status=1
+		fi
+	done < "$TASKS"
+fi
 
-	if [ -z "${out2:-}" ] || [ -n "${rest:-}" ]; then
-		echo "$0: malformed line: $infile ${out1:-} ${out2:-} ${rest:-}" >&2
-		status=1
-		continue
-	fi
-
-	# -q quiets the per-collision banner, -p sets the prefix file (which is also
-	# copied into both outputs), -o names the two outputs and must come last.
-	if ! "$BIN" -q -p "$infile" -o "$out1" "$out2" >/dev/null; then
-		echo "$0: failed on $infile" >&2
-		status=1
-		continue
-	fi
-
-	n=$((n + 1))
-done < "$TASKS"
 
 echo "$0: generated $n collisions"
 exit "$status"

@@ -1,3 +1,7 @@
 {
-    "cmake.sourceDirectory": "/home/onsigh/hellohpc-2nd/07-maimoe"
+    "cmake.sourceDirectory": "/home/onsigh/hellohpc-2nd/07-maimoe",
+    // 系统上 gcc-16 的 C 编译器装了、g++-16 的头文件没装，
+    // 导致 clangd 自动探测到 /usr/include/c++/16 后扑空，满屏红波浪线。
+    // 这里显式指定用 gcc-15 的头文件，与 make 实际调用的 g++-15 保持一致。
+    "clangd.fallbackFlags": ["--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15"]
 }

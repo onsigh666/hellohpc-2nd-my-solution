@@ -1,5 +1,5 @@
 CXX := g++
-CPPFLAGS := -O2 -march=native
+CPPFLAGS := -O2 -march=native -std=c++17 -pthread
 OBJS := block0.o block1.o block1stevens00.o block1stevens01.o block1stevens10.o block1stevens11.o block1wang.o main.o md5.o timer.o
 LIBS :=
 
