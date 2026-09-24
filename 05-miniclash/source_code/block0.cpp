@@ -5,7 +5,11 @@
 
 thread_local uint32 seed32_1, seed32_2;
 
-void find_block0(uint32 block[], const uint32 IV[]) {
+// 叫停开关：由调用方（批量模式的调度器）设置成本线程正在做的那个任务的
+// "已解决"标志。为空表示不叫停（单碰撞 CLI 路径就是这种情况）。
+thread_local const std::atomic<bool>* g_stop = nullptr;
+
+bool find_block0(uint32 block[], const uint32 IV[]) {
   uint32 Q[68] = {IV[0], IV[3], IV[2], IV[1]};
 
   std::vector<uint32> q4mask(1 << 4);
@@ -23,6 +27,10 @@ void find_block0(uint32 block[], const uint32 IV[]) {
                 0x0eb94f16;
 
   while (true) {
+    // 每轮外层循环查一次叫停开关。距上次检查最多隔一个 2^16 内层枚举
+    // (几毫秒)，所以叫停延迟可以忽略。relaxed 足够：只需"最终能看到"。
+    if (g_stop && g_stop->load(std::memory_order_relaxed)) return false;
+
     Q[Qoff + 1] = xrng64();
     Q[Qoff + 3] = (xrng64() & 0xfe87bc3f) | 0x017841c0;
     Q[Qoff + 4] =
@@ -281,7 +289,7 @@ void find_block0(uint32 block[], const uint32 IV[]) {
               (IV2[1] == IV1[1] + (1 << 31) + (1 << 25)) &&
               (IV2[2] == IV1[2] + (1 << 31) + (1 << 25)) &&
               (IV2[3] == IV1[3] + (1 << 31) + (1 << 25)))
-            return;
+            return true;
 
           if (IV2[0] != IV1[0] + (1 << 31)) std::cout << "!" << std::flush;
         }

@@ -1,3 +1,8 @@
+#include <atomic>
+
+// 非空且为 true 时，当前搜索立刻放弃。
+// 每个线程各自指向它正在做的那个任务的"solved"标志。
+extern thread_local const std::atomic<bool>* g_stop;
 /* Use one of the following typedef's */
 // #include <stdint.h>
 // typedef ::uint32_t uint32;
@@ -6,7 +11,8 @@ typedef unsigned int uint32;
 
 void md5_compress(uint32 ihv[], const uint32 block[]);
 
-void find_block0(uint32 block[], const uint32 IV[]);
+// 返回 false 表示被 g_stop 叫停，block[] 内容作废。
+bool find_block0(uint32 block[], const uint32 IV[]);
 void find_block1(uint32 block[], const uint32 IV[]);
 
 // very fast inlined xorshift random number generator with period 2^64 - 1

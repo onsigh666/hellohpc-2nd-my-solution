@@ -37,6 +37,8 @@ else
 		if ! "$BIN" -q -p "$infile" -o "$out1" "$out2" >/dev/null; then
 			echo "$0: failed on $infile" >&2
 			status=1
+		else
+			n=$((n + 1))
 		fi
 	done < "$TASKS"
 fi

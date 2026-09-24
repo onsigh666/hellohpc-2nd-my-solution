@@ -13,7 +13,8 @@ const uint32 MD5IV[] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
 
 unsigned load_block(istream& i, uint32 block[]);
 void save_block(ostream& o, const uint32 block[]);
-void find_collision(const uint32 IV[], uint32 msg1block0[], uint32 msg1block1[],
+// 返回 false 表示第一块搜索被 g_stop 叫停，输出参数全部作废。
+bool find_collision(const uint32 IV[], uint32 msg1block0[], uint32 msg1block1[],
                     uint32 msg2block0[], uint32 msg2block1[],
                     bool verbose = false);
 
@@ -51,6 +52,7 @@ int main()
 
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -272,11 +274,33 @@ static uint32 mix32(uint64 x) {
   return uint32(x ^ (x >> 31)) | 1u;
 }
 
-// 一个任务：读前缀 → 把补零后的前缀写进两个输出 → 求碰撞 → 追加 4 个块
-static bool solve_task(const std::string& infile, const std::string& out1,
-                       const std::string& out2, uint32 s1, uint32 s2) {
-  uint32 IV[4] = {MD5IV[0], MD5IV[1], MD5IV[2], MD5IV[3]};
+// 读前缀、链式压缩求出 IV。不写任何文件 —— 现在有 P 个搜索在抢同一个
+// 任务，只有赢家才写输出，所以算 IV 和写输出必须分开。
+static bool prefix_iv(const std::string& infile, uint32 IV[4]) {
+  IV[0] = MD5IV[0];
+  IV[1] = MD5IV[1];
+  IV[2] = MD5IV[2];
+  IV[3] = MD5IV[3];
 
+  std::ifstream ifs(infile.c_str(), std::ios::binary);
+  if (!ifs) return false;
+
+  uint32 block[16];
+  while (true) {
+    unsigned len = load_block(ifs, block);
+    if (!len) break;
+    md5_compress(IV, block);
+  }
+  return true;
+}
+
+// 只有赢家调用：把前缀（补零到 64 字节整块）和 4 个碰撞块写进两个文件。
+// load_block 会把不足 64 字节的最后一块补零，save_block 又把补的零一起
+// 写出去 —— 所以输出文件里前缀被补到整块，碰撞块才对齐得上。
+static bool write_outputs(const std::string& infile, const std::string& out1,
+                          const std::string& out2, const uint32* m1b0,
+                          const uint32* m1b1, const uint32* m2b0,
+                          const uint32* m2b1) {
   std::ifstream ifs(infile.c_str(), std::ios::binary);
   if (!ifs) return false;
   std::ofstream ofs1(out1.c_str(), std::ios::binary);
@@ -284,23 +308,13 @@ static bool solve_task(const std::string& infile, const std::string& out1,
   std::ofstream ofs2(out2.c_str(), std::ios::binary);
   if (!ofs2) return false;
 
-  // 这一段和原 -p 路径完全一致：load_block 会把不足 64 字节的
-  // 最后一块补零，save_block 又把补的零一起写出去 —— 所以输出文件里
-  // 前缀被补到 64 字节整块，碰撞块才对齐得上。
   uint32 block[16];
   while (true) {
     unsigned len = load_block(ifs, block);
     if (!len) break;
     save_block(ofs1, block);
     save_block(ofs2, block);
-    md5_compress(IV, block);
   }
-
-  seed32_1 = s1;  // 本线程的种子，不会互相踩
-  seed32_2 = s2;
-
-  uint32 m1b0[16], m1b1[16], m2b0[16], m2b1[16];
-  find_collision(IV, m1b0, m1b1, m2b0, m2b1);
 
   save_block(ofs1, m1b0);
   save_block(ofs1, m1b1);
@@ -349,23 +363,54 @@ int run_tasks(const char* taskfn) {
     return 1;
   }
 
-  unsigned P = usable_cores();
-  if (P > tasks.size()) P = unsigned(tasks.size());  // 任务比核少，多的线程没用
-  std::cerr << "tasks=" << tasks.size() << " threads=" << P << "\n";
+  const size_t N = tasks.size();
+  const unsigned P = usable_cores();
+  const size_t K = P;       // 每个任务同时开几个搜索 —— 就按核数来
+  const size_t NM = N * K;  // "搜索"总数：任务数 × K
 
-  std::atomic<size_t> next(0);  // 下一个该领的任务号
+  // std::atomic 不可拷贝，所以用 unique_ptr 数组
+  std::unique_ptr<std::atomic<bool>[]> solved(new std::atomic<bool>[N]);
+  for (size_t i = 0; i < N; ++i) solved[i].store(false);
+
+  std::cerr << "tasks=" << N << " threads=" << P << " missions=" << NM << "\n";
+
+  std::atomic<size_t> next(0);  // 下一个该领的搜索编号
   std::atomic<int> failures(0);
   std::mutex cout_mtx;
 
   std::vector<std::thread> pool;
   for (unsigned t = 0; t < P; ++t)
     pool.push_back(std::thread([&, t]() {
-      size_t i;
-      while ((i = next.fetch_add(1)) < tasks.size())  // 动态领任务
+      size_t m;
+      while ((m = next.fetch_add(1)) < NM)  // 动态领搜索
       {
-        uint64 tag = uint64(i) * 0x100000001B3ull + t;
-        bool ok = solve_task(tasks[i][0], tasks[i][1], tasks[i][2], mix32(tag),
-                             mix32(tag + 0x9E3779B97F4A7C15ull));
+        const size_t i = m / K;  // 第 m 个搜索属于第几个任务
+        if (solved[i].load(std::memory_order_relaxed))
+          continue;  // 这个任务已经被人搞定了
+
+        uint64 tag = uint64(m) * 0x9E3779B97F4A7C15ull + t;
+        uint32 s1 = mix32(tag), s2 = mix32(tag + 0x1234567ull);
+
+        uint32 IV[4];
+        if (!prefix_iv(tasks[i][0], IV)) {
+          ++failures;
+          continue;
+        }
+
+        uint32 m1b0[16], m1b1[16], m2b0[16], m2b1[16];
+        g_stop = &solved[i];  // 装好叫停开关
+        seed32_1 = s1;
+        seed32_2 = s2;
+        bool found = find_collision(IV, m1b0, m1b1, m2b0, m2b1);
+        g_stop = nullptr;
+
+        if (!found) continue;  // 被叫停，我的结果作废
+
+        // exchange 返回 true 表示之前已经是 true —— 别人先赢了
+        if (solved[i].exchange(true)) continue;
+
+        bool ok = write_outputs(tasks[i][0], tasks[i][1], tasks[i][2], m1b0,
+                                m1b1, m2b0, m2b1);
         if (!ok) ++failures;
         std::lock_guard<std::mutex> lk(cout_mtx);
         std::cout << (ok ? "ok " : "FAIL ") << i << " " << tasks[i][0] << "\n"
@@ -644,10 +689,10 @@ void save_block(ostream& o, const uint32 block[]) {
       o << (unsigned char)((block[k] >> (c * 8)) & 0xFF);
 }
 
-void find_collision(const uint32 IV[], uint32 msg1block0[], uint32 msg1block1[],
+bool find_collision(const uint32 IV[], uint32 msg1block0[], uint32 msg1block1[],
                     uint32 msg2block0[], uint32 msg2block1[], bool verbose) {
   if (verbose) cout << "Generating first block: " << flush;
-  find_block0(msg1block0, IV);
+  if (!find_block0(msg1block0, IV)) return false;  // 被叫停，后面全部作废
 
   uint32 IHV[4] = {IV[0], IV[1], IV[2], IV[3]};
   md5_compress(IHV, msg1block0);
@@ -666,4 +711,5 @@ void find_collision(const uint32 IV[], uint32 msg1block0[], uint32 msg1block1[],
   msg2block1[11] -= 1 << 15;
   msg2block1[14] += 1 << 31;
   if (verbose) cout << endl;
+  return true;
 }
