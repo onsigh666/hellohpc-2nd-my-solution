@@ -17,6 +17,7 @@ _C_SOURCE =r'''
 #include <math.h>
 #include <stddef.h>
 
+#define BQ 64
 void kernel_field(const float* restrict points,    
                   const float* restrict centers,    
                   const float* restrict weights,    
@@ -27,29 +28,36 @@ void kernel_field(const float* restrict points,
                   float* restrict out,              
                   int Q, int C, int D) {
 #pragma omp parallel for schedule(static)
-  for (int q = 0; q < Q; q++) {
-    const float* x =
-        points + (size_t)q * (size_t)D;  // get pointer of q th start
-    double acc = 0.0f;
-#pragma omp simd reduction(+:acc)
-    for (int c = 0; c < C; c++) {
-      const float* mu = centers + (size_t)c * (size_t)D;
-      const float* tv = trig_vec + (size_t)c * (size_t)D;
-
-      double rr = 0.0f; 
-      double pp = 0.0f; 
-#pragma GCC unroll 8
-      for (int d = 0; d < D; d++) {
-        float delta = x[d] - mu[d];
-        rr += delta * delta;
-        pp += x[d] * tv[d];
-      }
-      double arg_exp=-(double)scales[c]*rr;
-      double arg_sin=(double)trig_scale[c]*pp;
-      acc +=(double) weights[c] * (double)expf((float)arg_exp) +
-           (double)bias[c] *(double)sinf((float)arg_sin);
+  for (int qb = 0; qb < Q; qb += BQ) {
+    int nb = Q - qb < BQ ? Q - qb : BQ;   /* 最后一块可能不满 */
+    float xt[32][BQ];                      /* 转置块：(D, BQ) 布局，每线程栈上 8 KB */
+    double acc[BQ];
+    for (int j = 0; j < BQ; j++) acc[j] = 0.0;
+    
+    /* ① 转置：把 BQ 个点从 (点, D) 变成 (D, 点)，纯拷贝 */
+    for (int j = 0; j < nb; j++) {
+      const float* x = points + (size_t)(qb + j) * D;
+      for (int d = 0; d < D; d++) xt[d][j] = x[d];
     }
-    out[q] =(float)acc;
+    /* ② 主扫：中心 c 在外，点 j 在内（为 M2 的形状） */
+    for (int c = 0; c < C; c++) {
+      const float* mu = centers + (size_t)c * D;
+      const float* tv = trig_vec + (size_t)c * D;
+      float w = weights[c], sc = scales[c], bi = bias[c], ts = trig_scale[c];
+      for (int j = 0; j < nb; j++) {
+        double rr = 0.0, pp = 0.0;
+        for (int d = 0; d < D; d++) {
+          float delta = xt[d][j] - mu[d];
+          rr += delta * delta;
+          pp += xt[d][j] * tv[d];
+        }
+        acc[j] += (double)w * expf(-(float)(sc * rr))
+                + (double)bi * sinf((float)(ts * pp));
+      }
+    }
+
+    /* ③ 写回 */
+    for (int j = 0; j < nb; j++) out[qb + j] = (float)acc[j];
   }
 }
 
@@ -63,7 +71,7 @@ def _build_kernel():
         so = Path(tmp) / "kernel.so"
         src.write_text(_C_SOURCE, encoding="utf-8")
         subprocess.run(
-            ["gcc", "-O2", "-shared", "-fPIC","-fopenmp","-funroll-loops",
+            ["gcc", "-O2", "-shared", "-fPIC","-fopenmp","-funroll-loops","-march=native"
              "-o", str(so), str(src), "-lm"],
             check=True, capture_output=True,
         )
