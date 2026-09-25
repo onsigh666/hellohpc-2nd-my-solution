@@ -1,5 +1,7 @@
 #include <iostream>
 
+#include <cstdint>
+
 #include "main.hpp"
 
 thread_local uint32 seed32_1, seed32_2;
@@ -16,7 +18,8 @@ namespace {
 struct mask_tables {
   uint32 q4[1 << 4];
   uint32 q9q10[1 << 3];
-  uint32 q9[1 << 16];
+  // SIMD 版 counter4 循环按 4 个一组做 16 字节加载，表头必须 16 字节对齐。
+  alignas(16) uint32 q9[1 << 16];
 
   mask_tables() {
     for (unsigned k = 0; k < (1 << 4); ++k)
@@ -29,6 +32,35 @@ struct mask_tables {
               0x0eb94f16;
   }
 };
+
+// ---------------- counter4 循环的 SIMD 工具（GCC/Clang 向量扩展） ----------------
+// u32x4 = 4 个 uint32 的向量：x86_64 映射到 SSE2、AArch64 映射到 NEON，
+// 同一份源码两端都能编，本地对拍即验真身（服务器用 NEON，寄存器 32 个）。
+typedef uint32 u32x4 __attribute__((vector_size(16)));
+typedef int32_t s32x4 __attribute__((vector_size(16)));
+
+inline u32x4 vdup(uint32 x) { return u32x4{x, x, x, x}; }
+// 循环左/右移。NEON 没有 32 位 ror 指令，向量版 = 2 移 1 或，这是向量每步
+// 比标量(1 条 ROR)贵的主要来源，其余运算向量/标量指令数相当。
+inline u32x4 vrotl(u32x4 x, unsigned n) { return (x << n) | (x >> (32 - n)); }
+inline u32x4 vrotr(u32x4 x, unsigned n) { return (x >> n) | (x << (32 - n)); }
+// 每 lane 算术右移 31 位：该 lane 的 bit31 为 1 则得全 1(死)，否则全 0(活)。
+inline u32x4 vshra31(u32x4 x) { return (u32x4)((s32x4)x >> 31); }
+// alive 每 lane 全 1=活、全 0=死。用 64 位视角横向或，只需 4 条标量指令。
+inline bool all_dead(u32x4 alive) {
+  union {
+    u32x4 v;
+    uint64_t u[2];
+  } tmp = {alive};
+  return !(tmp.u[0] | tmp.u[1]);
+}
+inline u32x4 vFF(u32x4 b, u32x4 c, u32x4 d) { return d ^ (b & (c ^ d)); }
+inline u32x4 vGG(u32x4 b, u32x4 c, u32x4 d) { return c ^ (d & (b ^ c)); }
+inline u32x4 vHH(u32x4 b, u32x4 c, u32x4 d) { return b ^ c ^ d; }
+inline u32x4 vII(u32x4 b, u32x4 c, u32x4 d) { return c ^ (b | ~d); }
+
+#define VSTEP(f, a, b, c, d, m, ac, rc) \
+  (a = vrotl((a) + f(b, c, d) + (m) + vdup(ac), rc) + (b))
 
 // 文件作用域静态对象：main 之前构造一次，之后全程只读。
 // 只读 => 所有搜索线程共享同一份，无数据竞争，也不需要加锁。
@@ -196,115 +228,156 @@ bool find_block0(uint32 block[], const uint32 IV[]) {
         // iterate over possible changes of q9
         // while keeping intact conditions on q1-q24
         // this changes m8, m9 and m12 (but not m10!)
-        for (unsigned counter4 = 0; counter4 < (1 << 16); ++counter4) {
-          uint32 q9 = Q[Qoff + 9] ^ g_masks.q9[counter4];
-          block[12] = tt12 - FF(Q[Qoff + 12], Q[Qoff + 11], q10) - q9;
-          uint32 m8 = q9 - Q[Qoff + 8];
-          block[8] = RR(m8, 7) - tt8;
-          uint32 m9 = q10 - q9;
-          block[9] = RR(m9, 12) - FF(q9, Q[Qoff + 8], Q[Qoff + 7]) - tt9;
+        //
+        // SIMD 版：一次枚举 4 个 q9 候选。18 个早退检查改成"存活 lane 掩码"：
+        // 死 lane 继续算（垃圾值不看），整组全死才换下一组。理论加速上限 =
+        // 步数比：标量每候选平均 ~22 步、向量每组 4 个平均 ~30 步，≈2.9×；
+        // 实际被向量旋转(2移1或)与全死检查拖累，以实测为准。
+        const u32x4 vQ8 = vdup(Q[Qoff + 8]), vQ7 = vdup(Q[Qoff + 7]),
+                    vQ9 = vdup(Q[Qoff + 9]), vq10 = vdup(q10);
+        const u32x4 v_aa = vdup(aa), v_bb = vdup(bb), v_cc = vdup(cc),
+                    v_dd = vdup(dd);
+        const u32x4 vb0 = vdup(block[0]), vb1 = vdup(block[1]),
+                    vb2 = vdup(block[2]), vb3 = vdup(block[3]),
+                    vb4 = vdup(block[4]), vb5 = vdup(block[5]),
+                    vb6 = vdup(block[6]), vb7 = vdup(block[7]),
+                    vb10 = vdup(block[10]), vb11 = vdup(block[11]),
+                    vb13 = vdup(block[13]), vb14 = vdup(block[14]),
+                    vb15 = vdup(block[15]);
+        // block[12] = (tt12 - FF(Q12, Q11, q10)) - q9：括号部分不随 q9 变。
+        const u32x4 vb12_base = vdup(tt12 - FF(Q[Qoff + 12], Q[Qoff + 11], q10));
+        const u32x4 vtt8 = vdup(tt8), vtt9 = vdup(tt9);
 
-          uint32 a = aa, b = bb, c = cc, d = dd;
-          MD5_STEP(GG, a, b, c, d, block[9], 0x21e1cde6, 5);
-          MD5_STEP(GG, d, a, b, c, block[14], 0xc33707d6, 9);
-          MD5_STEP(GG, c, d, a, b, block[3], 0xf4d50d87, 14);
-          MD5_STEP(GG, b, c, d, a, block[8], 0x455a14ed, 20);
-          MD5_STEP(GG, a, b, c, d, block[13], 0xa9e3e905, 5);
-          MD5_STEP(GG, d, a, b, c, block[2], 0xfcefa3f8, 9);
-          MD5_STEP(GG, c, d, a, b, block[7], 0x676f02d9, 14);
-          MD5_STEP(GG, b, c, d, a, block[12], 0x8d2a4c8a, 20);
-          MD5_STEP(HH, a, b, c, d, block[5], 0xfffa3942, 4);
-          MD5_STEP(HH, d, a, b, c, block[8], 0x8771f681, 11);
+        for (unsigned counter4 = 0; counter4 < (1 << 16); counter4 += 4) {
+          // 4 个候选的 q9 与随 q9 变的三个块词。g_masks.q9 已按 16 字节对齐，
+          // counter4 步长是 4，所以这是对齐的 16 字节加载。
+          u32x4 q9 = vQ9 ^ *(const u32x4*)&g_masks.q9[counter4];
+          u32x4 b12 = vb12_base - q9;
+          u32x4 b8 = vrotr(q9 - vQ8, 7) - vtt8;
+          u32x4 b9 = vrotr(vq10 - q9, 12) - vFF(q9, vQ8, vQ7) - vtt9;
 
-          c += HH(d, a, b) + block[11] + 0x6d9d6122;
-          if (0 != (c & (1 << 15))) continue;
-          c = (c << 16 | c >> 16) + d;
+          u32x4 a = v_aa, b = v_bb, c = v_cc, d = v_dd;
+          u32x4 alive = vdup(0xFFFFFFFFu);
+          VSTEP(vGG, a, b, c, d, b9, 0x21e1cde6, 5);
+          VSTEP(vGG, d, a, b, c, vb14, 0xc33707d6, 9);
+          VSTEP(vGG, c, d, a, b, vb3, 0xf4d50d87, 14);
+          VSTEP(vGG, b, c, d, a, b8, 0x455a14ed, 20);
+          VSTEP(vGG, a, b, c, d, vb13, 0xa9e3e905, 5);
+          VSTEP(vGG, d, a, b, c, vb2, 0xfcefa3f8, 9);
+          VSTEP(vGG, c, d, a, b, vb7, 0x676f02d9, 14);
+          VSTEP(vGG, b, c, d, a, b12, 0x8d2a4c8a, 20);
+          VSTEP(vHH, a, b, c, d, vb5, 0xfffa3942, 4);
+          VSTEP(vHH, d, a, b, c, b8, 0x8771f681, 11);
 
-          MD5_STEP(HH, b, c, d, a, block[14], 0xfde5380c, 23);
-          MD5_STEP(HH, a, b, c, d, block[1], 0xa4beea44, 4);
-          MD5_STEP(HH, d, a, b, c, block[4], 0x4bdecfa9, 11);
-          MD5_STEP(HH, c, d, a, b, block[7], 0xf6bb4b60, 16);
-          MD5_STEP(HH, b, c, d, a, block[10], 0xbebfbc70, 23);
-          MD5_STEP(HH, a, b, c, d, block[13], 0x289b7ec6, 4);
-          MD5_STEP(HH, d, a, b, c, block[0], 0xeaa127fa, 11);
-          MD5_STEP(HH, c, d, a, b, block[3], 0xd4ef3085, 16);
-          MD5_STEP(HH, b, c, d, a, block[6], 0x04881d05, 23);
-          MD5_STEP(HH, a, b, c, d, block[9], 0xd9d4d039, 4);
-          MD5_STEP(HH, d, a, b, c, block[12], 0xe6db99e5, 11);
-          MD5_STEP(HH, c, d, a, b, block[15], 0x1fa27cf8, 16);
-          MD5_STEP(HH, b, c, d, a, block[2], 0xc4ac5665, 23);
-          if (0 != ((b ^ d) & 0x80000000)) continue;
+          c += vHH(d, a, b) + vb11 + vdup(0x6d9d6122u);
+          // 检查 1：c 的 bit15 必须为 0。左移 16 把 bit15 顶到 bit31，
+          // vshra31 得全 1(死)/全 0(活)，&=~ 即杀置位 lane。
+          alive &= ~vshra31(c << 16);
+          if (all_dead(alive)) continue;
+          c = vrotl(c, 16) + d;
 
-          MD5_STEP(II, a, b, c, d, block[0], 0xf4292244, 6);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, d, a, b, c, block[7], 0x432aff97, 10);
-          if (0 == ((b ^ d) >> 31)) continue;
-          MD5_STEP(II, c, d, a, b, block[14], 0xab9423a7, 15);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, b, c, d, a, block[5], 0xfc93a039, 21);
-          if (0 != ((b ^ d) >> 31)) continue;
-          MD5_STEP(II, a, b, c, d, block[12], 0x655b59c3, 6);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, d, a, b, c, block[3], 0x8f0ccc92, 10);
-          if (0 != ((b ^ d) >> 31)) continue;
-          MD5_STEP(II, c, d, a, b, block[10], 0xffeff47d, 15);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, b, c, d, a, block[1], 0x85845dd1, 21);
-          if (0 != ((b ^ d) >> 31)) continue;
-          MD5_STEP(II, a, b, c, d, block[8], 0x6fa87e4f, 6);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, d, a, b, c, block[15], 0xfe2ce6e0, 10);
-          if (0 != ((b ^ d) >> 31)) continue;
-          MD5_STEP(II, c, d, a, b, block[6], 0xa3014314, 15);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, b, c, d, a, block[13], 0x4e0811a1, 21);
-          if (0 == ((b ^ d) >> 31)) continue;
-          MD5_STEP(II, a, b, c, d, block[4], 0xf7537e82, 6);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, d, a, b, c, block[11], 0xbd3af235, 10);
-          if (0 != ((b ^ d) >> 31)) continue;
-          MD5_STEP(II, c, d, a, b, block[2], 0x2ad7d2bb, 15);
-          if (0 != ((a ^ c) >> 31)) continue;
-          MD5_STEP(II, b, c, d, a, block[9], 0xeb86d391, 21);
+          VSTEP(vHH, b, c, d, a, vb14, 0xfde5380c, 23);
+          VSTEP(vHH, a, b, c, d, vb1, 0xa4beea44, 4);
+          VSTEP(vHH, d, a, b, c, vb4, 0x4bdecfa9, 11);
+          VSTEP(vHH, c, d, a, b, vb7, 0xf6bb4b60, 16);
+          VSTEP(vHH, b, c, d, a, vb10, 0xbebfbc70, 23);
+          VSTEP(vHH, a, b, c, d, vb13, 0x289b7ec6, 4);
+          VSTEP(vHH, d, a, b, c, vb0, 0xeaa127fa, 11);
+          VSTEP(vHH, c, d, a, b, vb3, 0xd4ef3085, 16);
+          VSTEP(vHH, b, c, d, a, vb6, 0x04881d05, 23);
+          VSTEP(vHH, a, b, c, d, b9, 0xd9d4d039, 4);
+          VSTEP(vHH, d, a, b, c, b12, 0xe6db99e5, 11);
+          VSTEP(vHH, c, d, a, b, vb15, 0x1fa27cf8, 16);
+          VSTEP(vHH, b, c, d, a, vb2, 0xc4ac5665, 23);
+          // 检查 2：(b^d) 的 bit31 必须为 0。
+          alive &= ~vshra31(b ^ d);
+          if (all_dead(alive)) continue;
 
-          uint32 IHV1 = b + IV[1];
-          uint32 IHV2 = c + IV[2];
-          uint32 IHV3 = d + IV[3];
+          // II 段 15 个检查，死因有两种："死 if 置位"用 ~，"死 if 清零"不用。
+          VSTEP(vII, a, b, c, d, vb0, 0xf4292244, 6);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, d, a, b, c, vb7, 0x432aff97, 10);
+          alive &= vshra31(b ^ d); if (all_dead(alive)) continue;
+          VSTEP(vII, c, d, a, b, vb14, 0xab9423a7, 15);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, b, c, d, a, vb5, 0xfc93a039, 21);
+          alive &= ~vshra31(b ^ d); if (all_dead(alive)) continue;
+          VSTEP(vII, a, b, c, d, b12, 0x655b59c3, 6);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, d, a, b, c, vb3, 0x8f0ccc92, 10);
+          alive &= ~vshra31(b ^ d); if (all_dead(alive)) continue;
+          VSTEP(vII, c, d, a, b, vb10, 0xffeff47d, 15);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, b, c, d, a, vb1, 0x85845dd1, 21);
+          alive &= ~vshra31(b ^ d); if (all_dead(alive)) continue;
+          VSTEP(vII, a, b, c, d, b8, 0x6fa87e4f, 6);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, d, a, b, c, vb15, 0xfe2ce6e0, 10);
+          alive &= ~vshra31(b ^ d); if (all_dead(alive)) continue;
+          VSTEP(vII, c, d, a, b, vb6, 0xa3014314, 15);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, b, c, d, a, vb13, 0x4e0811a1, 21);
+          alive &= vshra31(b ^ d); if (all_dead(alive)) continue;
+          VSTEP(vII, a, b, c, d, vb4, 0xf7537e82, 6);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, d, a, b, c, vb11, 0xbd3af235, 10);
+          alive &= ~vshra31(b ^ d); if (all_dead(alive)) continue;
+          VSTEP(vII, c, d, a, b, vb2, 0x2ad7d2bb, 15);
+          alive &= ~vshra31(a ^ c); if (all_dead(alive)) continue;
+          VSTEP(vII, b, c, d, a, b9, 0xeb86d391, 21);
 
-          bool wang = true;
-          if (0x02000000 != ((IHV2 ^ IHV1) & 0x86000000)) wang = false;
-          if (0 != ((IHV1 ^ IHV3) & 0x82000000)) wang = false;
-          if (0 != (IHV1 & 0x06000020)) wang = false;
+          // 40 步 + 18 检查全过的 lane（极稀有）。按 lane 升序走原标量终检，
+          // 最先成功的立即返回 —— 与标量版"先找到先返回"完全一致，输出逐字节相同。
+          union {
+            u32x4 v;
+            uint32_t u[4];
+          } lb = {b}, lc = {c}, ld = {d}, l8 = {b8}, l9 = {b9}, l12 = {b12},
+            lm = {alive};
+          for (unsigned lane = 0; lane < 4; ++lane) {
+            if (0 == lm.u[lane]) continue;
+            block[12] = l12.u[lane];
+            block[8] = l8.u[lane];
+            block[9] = l9.u[lane];
 
-          bool stevens = true;
-          if (((IHV1 ^ IHV2) >> 31) != 0 || ((IHV1 ^ IHV3) >> 31) != 0)
-            stevens = false;
-          if ((IHV3 & (1 << 25)) != 0 || (IHV2 & (1 << 25)) != 0 ||
-              (IHV1 & (1 << 25)) != 0 || ((IHV2 ^ IHV1) & 1) != 0)
-            stevens = false;
+            uint32 IHV1 = lb.u[lane] + IV[1];
+            uint32 IHV2 = lc.u[lane] + IV[2];
+            uint32 IHV3 = ld.u[lane] + IV[3];
 
-          if (!(wang || stevens)) continue;
+            bool wang = true;
+            if (0x02000000 != ((IHV2 ^ IHV1) & 0x86000000)) wang = false;
+            if (0 != ((IHV1 ^ IHV3) & 0x82000000)) wang = false;
+            if (0 != (IHV1 & 0x06000020)) wang = false;
 
-          std::cout << "." << std::flush;
+            bool stevens = true;
+            if (((IHV1 ^ IHV2) >> 31) != 0 || ((IHV1 ^ IHV3) >> 31) != 0)
+              stevens = false;
+            if ((IHV3 & (1 << 25)) != 0 || (IHV2 & (1 << 25)) != 0 ||
+                (IHV1 & (1 << 25)) != 0 || ((IHV2 ^ IHV1) & 1) != 0)
+              stevens = false;
 
-          uint32 IV1[4], IV2[4];
-          for (int t = 0; t < 4; ++t) IV2[t] = IV1[t] = IV[t];
+            if (!(wang || stevens)) continue;
 
-          uint32 block2[16];
-          for (int t = 0; t < 16; ++t) block2[t] = block[t];
-          block2[4] += 1 << 31;
-          block2[11] += 1 << 15;
-          block2[14] += 1 << 31;
+            std::cout << "." << std::flush;
 
-          md5_compress(IV1, block);
-          md5_compress(IV2, block2);
-          if ((IV2[0] == IV1[0] + (1 << 31)) &&
-              (IV2[1] == IV1[1] + (1 << 31) + (1 << 25)) &&
-              (IV2[2] == IV1[2] + (1 << 31) + (1 << 25)) &&
-              (IV2[3] == IV1[3] + (1 << 31) + (1 << 25)))
-            return true;
+            uint32 IV1[4], IV2[4];
+            for (int t = 0; t < 4; ++t) IV2[t] = IV1[t] = IV[t];
 
-          if (IV2[0] != IV1[0] + (1 << 31)) std::cout << "!" << std::flush;
+            uint32 block2[16];
+            for (int t = 0; t < 16; ++t) block2[t] = block[t];
+            block2[4] += 1 << 31;
+            block2[11] += 1 << 15;
+            block2[14] += 1 << 31;
+
+            md5_compress(IV1, block);
+            md5_compress(IV2, block2);
+            if ((IV2[0] == IV1[0] + (1 << 31)) &&
+                (IV2[1] == IV1[1] + (1 << 31) + (1 << 25)) &&
+                (IV2[2] == IV1[2] + (1 << 31) + (1 << 25)) &&
+                (IV2[3] == IV1[3] + (1 << 31) + (1 << 25)))
+              return true;
+
+            if (IV2[0] != IV1[0] + (1 << 31)) std::cout << "!" << std::flush;
+          }
         }
       }
     }
