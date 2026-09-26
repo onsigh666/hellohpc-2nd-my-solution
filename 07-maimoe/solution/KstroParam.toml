@@ -7,5 +7,5 @@ io_workers = 0
 write_batch = 1
 queue_partitions = 1
 partition_steal = "shared"
-schedule_policy = "manifest"
+schedule_policy = "size_desc"
 schedule_hybrid_weight = 100
