@@ -1,8 +1,8 @@
-cpu_workers = 1
+cpu_workers = 8
 input_readers = 0
 prefetch_depth = 0
 compute_batch = 1
-pipeline_mib = 1
+pipeline_mib = 64
 io_workers = 0
 write_batch = 1
 queue_partitions = 1
