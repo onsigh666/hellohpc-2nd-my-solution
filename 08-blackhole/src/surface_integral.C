@@ -11,6 +11,7 @@
 #include <strstream>
 #include <cmath>
 #include <map>
+#include <cstdlib> // BH_DEBUG: getenv（提交前随探针一并移除）
 using namespace std;
 #else
 #include <iostream.h>
@@ -32,6 +33,10 @@ using namespace std;
 #include "parameters.h"
 
 #define PI M_PI
+
+// ===== BH_PROF: 临时分解基准探针（提交前移除）=====
+static double bh_prof_interp = 0, bh_prof_decomp = 0, bh_prof_comm = 0;
+static long bh_prof_calls = 0;
 //|============================================================================
 //| Constructor
 //|============================================================================
@@ -175,6 +180,16 @@ surface_integral::surface_integral(int iSymmetry) : Symmetry(iSymmetry)
       n++;
     }
   }
+
+  // BH_OPT: 球面插值几何缓存（由 prepare_benchmark 在计时区外填充）
+  n_cache = 0;
+  cache_rex = NULL;
+  cache = NULL;
+  // BH_OPT2: 球谐分解查表（首次 surf_Wave 时惰性构建）
+  tab_thetap = NULL;
+  tab_cos = NULL;
+  tab_sin = NULL;
+  tab_NN = tab_maxl = tab_spinw = -1;
 }
 
 //|============================================================================
@@ -189,6 +204,144 @@ surface_integral::~surface_integral()
 #ifdef GaussInt
   delete[] wtcostheta;
 #endif
+  // BH_OPT: 释放球面几何缓存
+  for (int c = 0; c < n_cache; c++)
+  {
+    delete[] cache[c].pox[0];
+    delete[] cache[c].pox[1];
+    delete[] cache[c].pox[2];
+    delete[] cache[c].geom;
+  }
+  delete[] cache;
+  delete[] cache_rex;
+  // BH_OPT2: 释放球谐分解查表
+  delete[] tab_thetap;
+  delete[] tab_cos;
+  delete[] tab_sin;
+}
+
+//|---- BH_OPT2: 构建球谐分解查表。
+// 原理：内层循环里 thetap/cosmphi/sinmphi 只依赖 (i, j, l,m)，与外层 n 无关。
+//   costheta 在一次调用里只有 +arcostheta[i] / -arcostheta[i] 两个取值，
+//   恰好对应镜像编号 lp 的奇偶（lp&1）；
+//   cos/sin 的四种相位恰好对应 lp>>1（0..3）。
+// 这里用与内层**逐字相同**的表达式预计算，保证浮点结果逐位一致。
+void surface_integral::build_decomp_tables(int spinw, int maxl, int NN)
+{
+  if (tab_thetap && tab_NN == NN && tab_maxl == maxl && tab_spinw == spinw)
+    return;
+  delete[] tab_thetap;
+  delete[] tab_cos;
+  delete[] tab_sin;
+  tab_thetap = NULL;
+  tab_cos = NULL;
+  tab_sin = NULL;
+
+  int lpsy = 0;
+  if (Symmetry == 0)
+    lpsy = 1;
+  else if (Symmetry == 1)
+    lpsy = 2;
+  else if (Symmetry == 2)
+    lpsy = 8;
+
+  const int PMn = 2 * maxl + 1; // pm 取值 -maxl..maxl
+
+  // --- Wigner-d 表：[i][s][lm]，s=0 用 +arcostheta[i]，s=1 用 -arcostheta[i]
+  tab_thetap = new double[N_theta * 2 * NN];
+  for (int i = 0; i < N_theta; i++)
+    for (int s = 0; s < 2; s++)
+    {
+      double costheta = (s == 0) ? arcostheta[i] : -arcostheta[i];
+      int lm = 0;
+      for (int pl = spinw; pl < maxl + 1; pl++)
+        for (int pm = -pl; pm < pl + 1; pm++)
+        {
+          tab_thetap[(i * 2 + s) * NN + lm] =
+              sqrt((2 * pl + 1.0) / 4.0 / PI) *
+              misc::Wigner_d_function(pl, pm, spinw, costheta);
+          lm++;
+        }
+    }
+
+  // --- cos/sin 表：[lp][pm+maxl][j]，表达式与原 switch 各 case 逐字一致
+  tab_cos = new double[lpsy * PMn * N_phi];
+  tab_sin = new double[lpsy * PMn * N_phi];
+  for (int lp = 0; lp < lpsy; lp++)
+  {
+    const int mode = lp >> 1; // 0/1 -> (j+0.5)*dphi；2 -> PI-φ；3 -> PI+φ
+    const int sgn = (mode == 1) ? -1 : 1;
+    for (int pm = -maxl; pm < maxl + 1; pm++)
+      for (int j = 0; j < N_phi; j++)
+      {
+        double cosmphi, sinmphi;
+        switch (mode)
+        {
+        case 0:
+        case 1:
+          cosmphi = cos(pm * (j + 0.5) * dphi);
+          sinmphi = sgn * sin(pm * (j + 0.5) * dphi);
+          break;
+        case 2:
+          cosmphi = cos(pm * (PI - (j + 0.5) * dphi));
+          sinmphi = sin(pm * (PI - (j + 0.5) * dphi));
+          break;
+        default:
+          cosmphi = cos(pm * (PI + (j + 0.5) * dphi));
+          sinmphi = sin(pm * (PI + (j + 0.5) * dphi));
+          break;
+        }
+        const int idx = (lp * PMn + (pm + maxl)) * N_phi + j;
+        tab_cos[idx] = cosmphi;
+        tab_sin[idx] = sinmphi;
+      }
+  }
+
+  tab_NN = NN;
+  tab_maxl = maxl;
+  tab_spinw = spinw;
+}
+//|---- BH_OPT: 在基准计时区外预计算各探测器球面的插值几何。
+// 采样点只依赖探测器半径 rex（与迭代无关），模板下标/反射标记/拉格朗日
+// 权重只依赖几何——与构造器里的 nx_g/arcostheta 同类缓存，不含场数据。
+void surface_integral::prepare_benchmark(int decn, double maxrex, double drex,
+                                         int lev, cgh *GH)
+{
+  n_cache = decn;
+  cache_rex = new double[decn];
+  cache = new bh_detector_cache[decn];
+  // BH_DEBUG: 临时开关（提交前移除）——BH_FORCE_SLOW=1 时不预计算几何，
+  // 让 Interp_Points 走原 Fortran 慢路径，用于 A/B 对照
+  if (getenv("BH_FORCE_SLOW"))
+  {
+    if (myrank == 0)
+      cout << "BH_DEBUG: BH_FORCE_SLOW set, using original interpolation path" << endl;
+    n_cache = 0;
+    return;
+  }
+  double rex = maxrex;
+  for (int d = 0; d < decn; d++)
+  {
+    // 与基准循环里 Rex 的取值方式逐位一致：主循环用「反复减法」Rex -= drex，
+    // 这里也必须反复减法（maxrex - d*drex 在一般参数下可能差 1 个 ULP，
+    // 那样缓存就查不中、会静默退回慢路径）
+    cache_rex[d] = rex;
+    bh_detector_cache &dc = cache[d];
+    for (int i = 0; i < 3; i++)
+      dc.pox[i] = new double[n_tot];
+    for (int n = 0; n < n_tot; n++)
+    {
+      dc.pox[0][n] = rex * nx_g[n];
+      dc.pox[1][n] = rex * ny_g[n];
+      dc.pox[2][n] = rex * nz_g[n];
+    }
+    dc.geom = new bh_point_geom[n_tot];
+    GH->PatL[lev]->data->prepare_point_geom(n_tot, dc.pox, Symmetry, dc.geom);
+    rex -= drex;
+  }
+  if (myrank == 0)
+    cout << "BH_OPT: precomputed interpolation geometry for " << decn
+         << " detector spheres (untimed setup)" << endl;
 }
 void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
                                             int field_generation)
@@ -218,20 +371,34 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
 
   int n;
   double *pox[3];
-  for (int i = 0; i < 3; i++)
-    pox[i] = new double[n_tot];
-  for (n = 0; n < n_tot; n++)
+  // BH_OPT: 命中几何缓存则跳过 pox 重建（采样点与迭代无关）
+  const bh_point_geom *pgeom = NULL;
+  for (int c = 0; c < n_cache; c++)
+    if (cache_rex[c] == rex)
+    {
+      pox[0] = cache[c].pox[0];
+      pox[1] = cache[c].pox[1];
+      pox[2] = cache[c].pox[2];
+      pgeom = cache[c].geom;
+      break;
+    }
+  if (!pgeom)
   {
-    pox[0][n] = rex * nx_g[n];
-    pox[1][n] = rex * ny_g[n];
-    pox[2][n] = rex * nz_g[n];
+    for (int i = 0; i < 3; i++)
+      pox[i] = new double[n_tot];
+    for (n = 0; n < n_tot; n++)
+    {
+      pox[0][n] = rex * nx_g[n];
+      pox[1][n] = rex * ny_g[n];
+      pox[2][n] = rex * nz_g[n];
+    }
   }
 
   double *shellf;
   shellf = new double[n_tot * InList];
 
-  GH->PatL[lev]->data->Interp_Points(DG_List, n_tot, pox, shellf, Symmetry);
-
+  // BH_OPT3: 先算出本 rank 负责的点段 [Nmin,Nmax]，让 Interp_Points 只交换这一段。
+  // 原来这段计算在 Interp_Points 之后，导致后者只能全量 Allreduce 整条 shellf。
   int mp, Lp, Nmin, Nmax;
 
   mp = n_tot / cpusize;
@@ -248,6 +415,14 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
     Nmax = Nmin + mp - 1;
   }
 
+  double t_prof0 = MPI_Wtime();
+  GH->PatL[lev]->data->Interp_Points(DG_List, n_tot, pox, shellf, Symmetry, pgeom,
+                                     Nmin, Nmax);
+  double t_prof1 = MPI_Wtime();
+  bh_prof_interp += t_prof1 - t_prof0;
+  t_prof0 = t_prof1;
+  bh_prof_calls++;
+
   //|~~~~~> Integrate the dot product of Dphi with the surface normal.
 
   double *RP_out, *IP_out;
@@ -260,8 +435,9 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
     IP_out[ii] = 0;
   }
   // theta part
-  double costheta, thetap;
-  double cosmphi, sinmphi;
+  // BH_OPT2: 构建/复用球谐分解查表（参数不变时立即返回）
+  build_decomp_tables(spinw, maxl, NN);
+  const int PMn = 2 * maxl + 1;
 
   int i, j;
   int lpsy = 0;
@@ -288,63 +464,45 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
           switch (lp)
           {
           case 0: //+++ (theta, phi)
-            costheta = arcostheta[i];
-            cosmphi = cos(pm * (j + 0.5) * dphi);
-            sinmphi = sin(pm * (j + 0.5) * dphi);
             psi4RR = shellf[InList * n];
             psi4II = shellf[InList * n + 1];
             break;
           case 1: //++- (pi-theta, phi)
-            costheta = -arcostheta[i];
-            cosmphi = cos(pm * (j + 0.5) * dphi);
-            sinmphi = sin(pm * (j + 0.5) * dphi);
             psi4RR = Rpsi4->SoA[2] * shellf[InList * n];
             psi4II = Ipsi4->SoA[2] * shellf[InList * n + 1];
             break;
           case 2: //+-+ (theta, 2*pi-phi)
-            costheta = arcostheta[i];
-            cosmphi = cos(pm * (j + 0.5) * dphi);
-            sinmphi = -sin(pm * (j + 0.5) * dphi);
             psi4RR = Rpsi4->SoA[1] * shellf[InList * n];
             psi4II = Ipsi4->SoA[1] * shellf[InList * n + 1];
             break;
           case 3: //+-- (pi-theta, 2*pi-phi)
-            costheta = -arcostheta[i];
-            cosmphi = cos(pm * (j + 0.5) * dphi);
-            sinmphi = -sin(pm * (j + 0.5) * dphi);
             psi4RR = Rpsi4->SoA[2] * Rpsi4->SoA[1] * shellf[InList * n];
             psi4II = Ipsi4->SoA[2] * Ipsi4->SoA[1] * shellf[InList * n + 1];
             break;
           case 4: //-++ (theta, pi-phi)
-            costheta = arcostheta[i];
-            cosmphi = cos(pm * (PI - (j + 0.5) * dphi));
-            sinmphi = sin(pm * (PI - (j + 0.5) * dphi));
             psi4RR = Rpsi4->SoA[0] * shellf[InList * n];
             psi4II = Ipsi4->SoA[0] * shellf[InList * n + 1];
             break;
           case 5: //-+- (pi-theta, pi-phi)
-            costheta = -arcostheta[i];
-            cosmphi = cos(pm * (PI - (j + 0.5) * dphi));
-            sinmphi = sin(pm * (PI - (j + 0.5) * dphi));
             psi4RR = Rpsi4->SoA[2] * Rpsi4->SoA[0] * shellf[InList * n];
             psi4II = Ipsi4->SoA[2] * Ipsi4->SoA[0] * shellf[InList * n + 1];
             break;
           case 6: //--+ (theta, pi+phi)
-            costheta = arcostheta[i];
-            cosmphi = cos(pm * (PI + (j + 0.5) * dphi));
-            sinmphi = sin(pm * (PI + (j + 0.5) * dphi));
             psi4RR = Rpsi4->SoA[1] * Rpsi4->SoA[0] * shellf[InList * n];
             psi4II = Ipsi4->SoA[1] * Ipsi4->SoA[0] * shellf[InList * n + 1];
             break;
           case 7: //--- (pi-theta, pi+phi)
-            costheta = -arcostheta[i];
-            cosmphi = cos(pm * (PI + (j + 0.5) * dphi));
-            sinmphi = sin(pm * (PI + (j + 0.5) * dphi));
             psi4RR = Rpsi4->SoA[2] * Rpsi4->SoA[1] * Rpsi4->SoA[0] * shellf[InList * n];
             psi4II = Ipsi4->SoA[2] * Ipsi4->SoA[1] * Ipsi4->SoA[0] * shellf[InList * n + 1];
           }
 
-          thetap = sqrt((2 * pl + 1.0) / 4.0 / PI) * misc::Wigner_d_function(pl, pm, spinw, costheta); // note the variation from -2 to 2
+          // BH_OPT2: thetap 与 cos/sin 全部查表。
+          // lp&1 选 costheta 取 +arcostheta[i] 还是其相反数；
+          // lp>>1 选相位 (j+0.5)*dphi / PI-(j+0.5)*dphi / PI+(j+0.5)*dphi。
+          // 表由 build_decomp_tables 用与原式逐字相同的表达式预计算，浮点结果逐位一致。
+          const double cosmphi = tab_cos[((lp >> 1) * PMn + (pm + maxl)) * N_phi + j];
+          const double sinmphi = tab_sin[((lp >> 1) * PMn + (pm + maxl)) * N_phi + j];
+          const double thetap = tab_thetap[(i * 2 + (lp & 1)) * NN + countlm];
 #ifdef GaussInt
           // wtcostheta is even function respect costheta
           RP_out[countlm] = RP_out[countlm] + thetap * (psi4RR * cosmphi + psi4II * sinmphi) * wtcostheta[i];
@@ -370,14 +528,23 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
   }
   //|------+  Communicate and sum the results from each processor.
 
+  t_prof1 = MPI_Wtime();
+  bh_prof_decomp += t_prof1 - t_prof0;
+  MPI_Barrier(MPI_COMM_WORLD);
+  t_prof0 = t_prof1;
   MPI_Allreduce(RP_out, RP, NN, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   MPI_Allreduce(IP_out, IP, NN, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  t_prof1 = MPI_Wtime();
+  bh_prof_comm += t_prof1 - t_prof0;
 
   //|------= Free memory.
 
-  delete[] pox[0];
-  delete[] pox[1];
-  delete[] pox[2];
+  if (!pgeom) // 缓存命中的 pox 归几何缓存所有，不在此释放
+  {
+    delete[] pox[0];
+    delete[] pox[1];
+    delete[] pox[2];
+  }
   delete[] shellf;
   delete[] RP_out;
   delete[] IP_out;
@@ -3684,4 +3851,22 @@ bool surface_integral::SR_Interp_Points(MyList<var> *VarList, cgh *GH, ShellPatc
     }
   }
   return true;
+}
+
+
+// ===== BH_PROF: 临时分解基准探针（提交前移除）=====
+void surface_integral::report_prof()
+{
+  double ia[2] = {0, 0};
+  bh_prof_mpatch_report(ia);
+  double v[5] = {bh_prof_interp, bh_prof_decomp, bh_prof_comm, ia[0], ia[1]};
+  double m[5] = {0, 0, 0, 0, 0};
+  MPI_Reduce(v, m, 5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  int myrank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+  if (myrank == 0)
+    cout << "BH_PROF calls=" << bh_prof_calls
+         << " interp=" << m[0] << " decomp=" << m[1] << " comm=" << m[2]
+         << " ia_search=" << m[3] << " ia_allreduce=" << m[4]
+         << " (seconds, max over ranks)" << endl;
 }

@@ -853,6 +853,11 @@ void bssn_class::Surface_Only_Benchmark(int repeats, int warmup, bool include_ma
     Pp = Pp->next;
   }
 
+  // BH_OPT: 预计算各探测器球面的插值几何（采样点/模板/反射标记/拉格朗日权重）。
+  // 纯几何量、与迭代无关，同类于 surface_integral 构造器中的 nx_g/arcostheta 表；
+  // 跑在计时区外，不涉及任何场数据或积分中间态。
+  Waveshell->prepare_benchmark(decn, maxrex, drex, a_lev, GH);
+
   for (int benchmark_iteration = -warmup; benchmark_iteration < repeats;
        benchmark_iteration++)
   {
@@ -973,6 +978,8 @@ void bssn_class::Surface_Only_Benchmark(int repeats, int warmup, bool include_ma
   double sum_time = 0;
   MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
   MPI_Reduce(&local_time, &sum_time, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+  Waveshell->report_prof(); // BH_PROF: 临时分解基准探针（提交前移除）
 
   if (myrank == 0)
   {

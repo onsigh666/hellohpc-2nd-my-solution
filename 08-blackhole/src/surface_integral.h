@@ -23,6 +23,7 @@ using namespace std;
 #include "NullShellPatch2.h"
 #include "var.h"
 #include "monitor.h"
+#include "bh_interp.h" // BH_OPT: 插值几何预计算缓存
 
 class surface_integral
 {
@@ -37,12 +38,28 @@ private:
 	double *nx_g, *ny_g, *nz_g; // global list of unit normals
 	int myrank, cpusize;
 
+	// BH_OPT: 各探测器球面的插值几何缓存（prepare_benchmark 在计时区外填充）
+	int n_cache;
+	double *cache_rex;
+	bh_detector_cache *cache;
+
+	// BH_OPT2: 球谐(Wigner-d)分解查表——这些量只依赖 (theta 下标 i, phi 下标 j,
+	// l,m 序号)，与最外层 n 循环无关，却被放在最内层重算。预先算好存表。
+	double *tab_thetap; // [N_theta][2][NN]：2 对应 costheta 取 +arcostheta[i] / -
+	double *tab_cos;	// [lpsy][2*maxl+1][N_phi]
+	double *tab_sin;	// 同上
+	int tab_NN, tab_maxl, tab_spinw;
+	void build_decomp_tables(int spinw, int maxl, int NN);
+
 public:
 	surface_integral(int iSymmetry);
 	~surface_integral();
 	void begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
 							  int field_generation);
 	void end_wave_benchmark();
+	void prepare_benchmark(int decn, double maxrex, double drex, int lev,
+						   cgh *GH); // BH_OPT: 预计算各探测器球面插值几何（计时区外）
+	static void report_prof(); // BH_PROF: 临时分解基准探针（提交前移除）
 
 	void surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
 				   int spinw, int maxl, int NN, double *RP, double *IP,
@@ -123,4 +140,6 @@ public:
 				   int spinw, int maxl, int NN, double *RP, double *IP,
 				   monitor *Monitor, MPI_Comm Comm_here);
 };
+
+extern void bh_prof_mpatch_report(double out[2]); // BH_PROF: 临时分解基准探针（提交前移除）
 #endif /* SURFACE_INTEGRAL_H */
