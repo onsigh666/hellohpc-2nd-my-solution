@@ -489,7 +489,8 @@ void Patch::checkPatch(bool buflog, const int out_rank)
 void Patch::Interp_Points(MyList<var> *VarList,
                           int NN, double **XX,
                           double *Shellf, int Symmetry,
-                          const bh_point_geom *geom, int n_lo, int n_hi)
+                          const bh_point_geom *geom, int n_lo, int n_hi,
+                          const int *mine, int n_mine)
 {
   // NOTE: we do not Synchnize variables here, make sure of that before calling this routine
   int myrank;
@@ -748,8 +749,14 @@ void Patch::Interp_Points(MyList<var> *VarList,
   // ========================= BH_OPT3 结束 =========================
 
   double t_ia0 = MPI_Wtime();
-  for (int j = 0; j < NN; j++) // run along points
+  // BH_OPT4: 传了本 rank 的点列表就只扫这些点，否则照旧全扫。
+  // 球面采样点只落在少数几个块上（实测 np=8 / np=32 都是 4 个 rank 分走全部 25600 点），
+  // 所以对大多数 rank 来说全扫是纯浪费；对忙的 rank 也省下不属于自己的那部分。
+  const bool scan_mine = (mine != 0 && n_mine >= 0 && !getenv("BH_NO_MINE")); // BH_A/B: 临时对照开关
+  const int n_scan = scan_mine ? n_mine : NN;
+  for (int scan = 0; scan < n_scan; scan++) // run along points
   {
+    const int j = scan_mine ? mine[scan] : scan;
     // BH_OPT: 命中预计算几何则直接走融合插值内核，跳过块搜索与 Fortran 插值链
     if (geom)
     {

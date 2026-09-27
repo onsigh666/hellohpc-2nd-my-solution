@@ -211,6 +211,7 @@ surface_integral::~surface_integral()
     delete[] cache[c].pox[1];
     delete[] cache[c].pox[2];
     delete[] cache[c].geom;
+    delete[] cache[c].mine; // BH_OPT4
   }
   delete[] cache;
   delete[] cache_rex;
@@ -337,6 +338,41 @@ void surface_integral::prepare_benchmark(int decn, double maxrex, double drex,
     }
     dc.geom = new bh_point_geom[n_tot];
     GH->PatL[lev]->data->prepare_point_geom(n_tot, dc.pox, Symmetry, dc.geom);
+    // BH_OPT4: 预计算本 rank 负责的点下标列表（计时区外），供 Interp_Points 只扫这份。
+    // 归属判断与 Interp_Points 完全一致（geom[n].BP 就是那里用的块指针）。
+    {
+      int cnt = 0;
+      for (int n = 0; n < n_tot; n++)
+        if (dc.geom[n].BP && dc.geom[n].BP->rank == myrank)
+          cnt++;
+      dc.mine = new int[cnt > 0 ? cnt : 1];
+      dc.n_mine = 0;
+      for (int n = 0; n < n_tot; n++)
+        if (dc.geom[n].BP && dc.geom[n].BP->rank == myrank)
+          dc.mine[dc.n_mine++] = n;
+
+      // BH_PROF: 负载均衡诊断（提交前移除）
+      int *all = new int[cpusize];
+      MPI_Allgather(&dc.n_mine, 1, MPI_INT, all, 1, MPI_INT, MPI_COMM_WORLD);
+      if (myrank == 0)
+      {
+        int mn = all[0], mx = all[0], sum = 0;
+        for (int r = 0; r < cpusize; r++)
+        {
+          if (all[r] < mn)
+            mn = all[r];
+          if (all[r] > mx)
+            mx = all[r];
+          sum += all[r];
+        }
+        cout << "BH_PROF detector[" << d << "] owned_points/rank:";
+        for (int r = 0; r < cpusize; r++)
+          cout << " " << all[r];
+        cout << "  (sum=" << sum << " min=" << mn << " max=" << mx
+             << " max/min=" << (mn > 0 ? (double)mx / mn : 0.0) << ")" << endl;
+      }
+      delete[] all;
+    }
     rex -= drex;
   }
   if (myrank == 0)
@@ -373,6 +409,8 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
   double *pox[3];
   // BH_OPT: 命中几何缓存则跳过 pox 重建（采样点与迭代无关）
   const bh_point_geom *pgeom = NULL;
+  const int *p_mine = NULL; // BH_OPT4: 本 rank 负责的点下标列表
+  int p_n_mine = -1;
   for (int c = 0; c < n_cache; c++)
     if (cache_rex[c] == rex)
     {
@@ -380,6 +418,8 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
       pox[1] = cache[c].pox[1];
       pox[2] = cache[c].pox[2];
       pgeom = cache[c].geom;
+      p_mine = cache[c].mine;
+      p_n_mine = cache[c].n_mine;
       break;
     }
   if (!pgeom)
@@ -417,7 +457,7 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
 
   double t_prof0 = MPI_Wtime();
   GH->PatL[lev]->data->Interp_Points(DG_List, n_tot, pox, shellf, Symmetry, pgeom,
-                                     Nmin, Nmax);
+                                     Nmin, Nmax, p_mine, p_n_mine);
   double t_prof1 = MPI_Wtime();
   bh_prof_interp += t_prof1 - t_prof0;
   t_prof0 = t_prof1;

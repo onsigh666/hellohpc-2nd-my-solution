@@ -27,11 +27,18 @@ struct bh_point_geom
   unsigned char refl[3][BH_ORDN_MAX]; // 该模板点是否越界反射（值需乘 var 的 SoA[d]）
 };
 
-// 单个探测器（固定 rex）的缓存：采样点 + 每点插值几何
+// 单个探测器（固定 rex）的缓存：采样点 + 每点插值几何 + 本 rank 负责的点列表
 struct bh_detector_cache
 {
   double *pox[3];        // 球面采样点（与迭代无关）
   bh_point_geom *geom;   // 每点插值几何
+  // BH_OPT4: 本 rank 负责的点下标列表（prepare_benchmark 里预计算，计时区外）。
+  // 球面采样点只落在少数几个块上：实测 np=8 与 np=32 的点数分布都恰好是
+  // 0/0/8826/6040/6040/4694/0/0（其余 rank 全为 0）——并行度被"球面穿过几个块"
+  // 锁死在 4，加 rank 没有用。所以每轮再遍历全部 n_tot 个点纯属白扫 65%，
+  // 改成只遍历自己这份。
+  int *mine;
+  int n_mine;
 };
 
 // 融合张量积插值内核。
