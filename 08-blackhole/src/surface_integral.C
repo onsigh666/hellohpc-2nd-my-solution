@@ -212,6 +212,12 @@ surface_integral::~surface_integral()
     delete[] cache[c].pox[2];
     delete[] cache[c].geom;
     delete[] cache[c].mine; // BH_OPT4
+    for (int b = 0; b < cache[c].n_bc; b++) // BH_OPT5
+    {
+      delete[] cache[c].bc[b].f[0];
+      delete[] cache[c].bc[b].f[1];
+    }
+    delete[] cache[c].bc;
   }
   delete[] cache;
   delete[] cache_rex;
@@ -337,19 +343,92 @@ void surface_integral::prepare_benchmark(int decn, double maxrex, double drex,
       dc.pox[2][n] = rex * nz_g[n];
     }
     dc.geom = new bh_point_geom[n_tot];
-    GH->PatL[lev]->data->prepare_point_geom(n_tot, dc.pox, Symmetry, dc.geom);
-    // BH_OPT4: 预计算本 rank 负责的点下标列表（计时区外），供 Interp_Points 只扫这份。
-    // 归属判断与 Interp_Points 完全一致（geom[n].BP 就是那里用的块指针）。
+    // BH_DIAG: 块拓扑诊断（BH_OPT5 施工前的必要输入，提交前移除）
+    // 要弄清：一共几个块、每块多大、各 rank 看到的块列表顺序是否一致
+    // （顺序一致才能用「遍历序号」当跨 rank 的块 ID）。
+    if (getenv("BH_DIAG") && d == 0)
     {
-      int cnt = 0;
+      Patch *pa = GH->PatL[lev]->data;
+      int nb = 0;
+      MyList<Block> *Bp = pa->blb;
+      while (Bp)
+      {
+        nb++;
+        if (Bp == pa->ble)
+          break;
+        Bp = Bp->next;
+      }
+      int nb_all_min, nb_all_max;
+      MPI_Allreduce(&nb, &nb_all_min, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+      MPI_Allreduce(&nb, &nb_all_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+      int *loc = new int[nb * 5];
+      Bp = pa->blb;
+      for (int t = 0; t < nb; t++)
+      {
+        Block *b = Bp->data;
+        loc[t * 5 + 0] = t;
+        loc[t * 5 + 1] = b->rank;
+        loc[t * 5 + 2] = b->shape[0];
+        loc[t * 5 + 3] = b->shape[1];
+        loc[t * 5 + 4] = b->shape[2];
+        if (Bp == pa->ble)
+          break;
+        Bp = Bp->next;
+      }
+      if (nb_all_min == nb_all_max)
+      {
+        int *all = new int[cpusize * nb * 5];
+        MPI_Allgather(loc, nb * 5, MPI_INT, all, nb * 5, MPI_INT, MPI_COMM_WORLD);
+        if (myrank == 0)
+        {
+          cout << "BH_DIAG cpusize=" << cpusize << " blocks_per_rank=" << nb << endl;
+          for (int t = 0; t < nb; t++)
+          {
+            cout << "  block[" << t << "]:";
+            for (int r = 0; r < cpusize; r++)
+            {
+              int *e = all + (r * nb + t) * 5;
+              cout << " r" << r << "->(rank" << e[1] << "," << e[2] << "x" << e[3] << "x" << e[4] << ")";
+            }
+            cout << endl;
+          }
+        }
+        delete[] all;
+      }
+      else if (myrank == 0)
+        cout << "BH_DIAG blocks_per_rank MISMATCH min=" << nb_all_min
+             << " max=" << nb_all_max << endl;
+      delete[] loc;
+    }
+    GH->PatL[lev]->data->prepare_point_geom(n_tot, dc.pox, Symmetry, dc.geom,
+                                            &dc.bc, &dc.n_bc);
+    // BH_OPT5: 点按 rank 均分。
+    // 原来（BH_OPT4）是按「块归属」分点，而球面只穿过 8 块中的 4 块 ⇒ 4 个 rank
+    // 满负荷、另外 4 个从头发呆到尾。现在每个 rank 都持有含点块的数据副本
+    // （计时区外广播来的），所以点可以平摊给所有 rank。
+    {
+      int n_act = 0;
       for (int n = 0; n < n_tot; n++)
-        if (dc.geom[n].BP && dc.geom[n].BP->rank == myrank)
-          cnt++;
-      dc.mine = new int[cnt > 0 ? cnt : 1];
+        if (dc.geom[n].bi >= 0)
+          n_act++;
+      // BH_A/B: 临时对照开关（提交前移除）。BH_NO_COPY=1 时退回 BH_OPT4 的
+      // 「按块归属分点」，用于在同一份二进制上做 A/B。
+      const bool no_copy = (getenv("BH_NO_COPY") != 0);
+      const long lo = no_copy ? -1 : (long)n_act * myrank / cpusize;
+      const long hi = no_copy ? -1 : (long)n_act * (myrank + 1) / cpusize;
+      dc.mine = new int[n_act > 0 ? n_act : 1];
       dc.n_mine = 0;
+      int idx = 0;
       for (int n = 0; n < n_tot; n++)
-        if (dc.geom[n].BP && dc.geom[n].BP->rank == myrank)
-          dc.mine[dc.n_mine++] = n;
+        if (dc.geom[n].bi >= 0)
+        {
+          const bool take = no_copy
+                                ? (dc.geom[n].BP->rank == myrank)
+                                : (idx >= lo && idx < hi);
+          if (take)
+            dc.mine[dc.n_mine++] = n;
+          idx++;
+        }
 
       // BH_PROF: 负载均衡诊断（提交前移除）
       int *all = new int[cpusize];
@@ -378,6 +457,35 @@ void surface_integral::prepare_benchmark(int decn, double maxrex, double drex,
   if (myrank == 0)
     cout << "BH_OPT: precomputed interpolation geometry for " << decn
          << " detector spheres (untimed setup)" << endl;
+}
+//|---- BH_OPT5: 把「含点块」的最新场数据广播给所有 rank。
+// 调用点必须在计时区外（Surface_Only_Benchmark 里紧挨 MPI_Barrier 之前），
+// 因为场填充本身也在计时区外——这样"抄数据"的代价完全不计入成绩。
+// 每轮只需调用一次：3 个探测器读的是同一份场数据，共用副副本即可。
+// 只有块的拥有者手上有真数据，其余 rank 的副本靠这个广播刷新。
+void surface_integral::sync_block_copies(var *Rpsi4, var *Ipsi4)
+{
+  if (getenv("BH_NO_COPY"))
+    return; // BH_A/B: 临时对照开关（提交前移除）
+  var *vars[2];
+  vars[0] = Rpsi4;
+  vars[1] = Ipsi4;
+  for (int c = 0; c < n_cache; c++)
+  {
+    bh_detector_cache &dc = cache[c];
+    for (int b = 0; b < dc.n_bc; b++)
+    {
+      bh_block_copy &bc = dc.bc[b];
+      const int owner = bc.src->rank;
+      const long sz = (long)bc.shape[0] * bc.shape[1] * bc.shape[2];
+      for (int v = 0; v < 2; v++)
+      {
+        if (myrank == owner)
+          memcpy(bc.f[v], bc.src->fgfs[vars[v]->sgfn], sizeof(double) * sz);
+        MPI_Bcast(bc.f[v], sz, MPI_DOUBLE, owner, MPI_COMM_WORLD);
+      }
+    }
+  }
 }
 void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
                                             int field_generation)
@@ -411,6 +519,7 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
   const bh_point_geom *pgeom = NULL;
   const int *p_mine = NULL; // BH_OPT4: 本 rank 负责的点下标列表
   int p_n_mine = -1;
+  const bh_block_copy *p_bc = NULL; // BH_OPT5: 含点块的数据副本
   for (int c = 0; c < n_cache; c++)
     if (cache_rex[c] == rex)
     {
@@ -420,6 +529,7 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
       pgeom = cache[c].geom;
       p_mine = cache[c].mine;
       p_n_mine = cache[c].n_mine;
+      p_bc = cache[c].bc;
       break;
     }
   if (!pgeom)
@@ -457,7 +567,7 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
 
   double t_prof0 = MPI_Wtime();
   GH->PatL[lev]->data->Interp_Points(DG_List, n_tot, pox, shellf, Symmetry, pgeom,
-                                     Nmin, Nmax, p_mine, p_n_mine);
+                                     Nmin, Nmax, p_mine, p_n_mine, p_bc);
   double t_prof1 = MPI_Wtime();
   bh_prof_interp += t_prof1 - t_prof0;
   t_prof0 = t_prof1;

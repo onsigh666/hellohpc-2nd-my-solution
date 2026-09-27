@@ -490,7 +490,8 @@ void Patch::Interp_Points(MyList<var> *VarList,
                           int NN, double **XX,
                           double *Shellf, int Symmetry,
                           const bh_point_geom *geom, int n_lo, int n_hi,
-                          const int *mine, int n_mine)
+                          const int *mine, int n_mine,
+                          const bh_block_copy *bc)
 {
   // NOTE: we do not Synchnize variables here, make sure of that before calling this routine
   int myrank;
@@ -763,15 +764,22 @@ void Patch::Interp_Points(MyList<var> *VarList,
       const bh_point_geom &g = geom[j];
       if (g.BP)
       {
-        if (myrank == g.BP->rank)
+        // BH_OPT5: 有块数据副本时，插值从副本取数（副本每轮在计时区外刷新），
+        // 于是「块属于谁」不再限制谁能算——点已经按 rank 均分过了，每个点只会
+        // 落在唯一一个 rank 的 mine 列表里，不会重复计算。
+        const bool use_copy = (bc != 0 && g.bi >= 0 && num_var <= 2 &&
+                               !getenv("BH_NO_COPY")); // BH_A/B: 临时对照开关
+        if (use_copy || myrank == g.BP->rank)
         {
           varl = VarList;
           int k = 0;
           while (varl) // run along variables
           {
-            shellf[j * num_var + k] = bh_fused_interp(g, g.BP->fgfs[varl->data->sgfn],
-                                                      g.BP->shape[0],
-                                                      g.BP->shape[0] * g.BP->shape[1],
+            const double *fsrc = use_copy ? bc[g.bi].f[k] : g.BP->fgfs[varl->data->sgfn];
+            const int fNx = use_copy ? bc[g.bi].shape[0] : g.BP->shape[0];
+            const int fNxy = use_copy ? bc[g.bi].shape[0] * bc[g.bi].shape[1]
+                                      : g.BP->shape[0] * g.BP->shape[1];
+            shellf[j * num_var + k] = bh_fused_interp(g, fsrc, fNx, fNxy,
                                                       varl->data->SoA);
             if (bh_dbg_on()) // BH_DEBUG: 临时对拍探针（提交前移除）
             {
@@ -1188,7 +1196,8 @@ void Patch::Interp_Points(MyList<var> *VarList,
 // 模板下标/钳位/反射逻辑与 fmisc.f90::global_interp 逐行等价；
 // 权重用拉格朗日直写形式（与 polint 的 Neville 算法是同一多项式）。
 void Patch::prepare_point_geom(int NN, double **XX, int Symmetry,
-                               bh_point_geom *geom)
+                               bh_point_geom *geom,
+                               bh_block_copy **pbc, int *pn_bc)
 {
   int myrank;
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
@@ -1207,11 +1216,48 @@ void Patch::prepare_point_geom(int NN, double **XX, int Symmetry,
     DH[i] = getdX(i);
   double llb[dim], uub[dim];
 
+  // BH_OPT5: 收集块列表，并为每个块备一份本地 X 坐标副本。
+  // Block 构造器只在拥有者 rank 上分配 X（见 Block.C 的 if (myrank == rank)），
+  // 但几何计算现在每个 rank 都要做——因为块数据副本每轮会广播过来。X 是纯几何量、
+  // 不随时间变，这里从拥有者广播一次即可（8 块合计约 6KB，且只在计时区外做一次）。
+  // 用广播而不是本地按 bbox+shape 重建，是为了跟拥有者的 X 逐位一致：插值几何
+  // 对 X 的末位差异是敏感的（cx 由 X 算出，权重再由 cx 算出）。
+  MyList<Block> *BpL = blb;
+  int nb = 0;
+  while (BpL)
+  {
+    nb++;
+    if (BpL == ble)
+      break;
+    BpL = BpL->next;
+  }
+  Block **blks = new Block *[nb > 0 ? nb : 1];
+  BpL = blb;
+  for (int t = 0; t < nb; t++)
+  {
+    blks[t] = BpL->data;
+    if (BpL == ble)
+      break;
+    BpL = BpL->next;
+  }
+  double **Xc = new double *[nb * dim];
+  for (int t = 0; t < nb; t++)
+    for (int m = 0; m < dim; m++)
+    {
+      const int ns = blks[t]->shape[m];
+      double *p = new double[ns];
+      if (myrank == blks[t]->rank)
+        memcpy(p, blks[t]->X[m], sizeof(double) * ns);
+      MPI_Bcast(p, ns, MPI_DOUBLE, blks[t]->rank, MPI_COMM_WORLD);
+      Xc[t * dim + m] = p;
+    }
+
   for (int j = 0; j < NN; j++)
   {
     bh_point_geom &g = geom[j];
     memset(&g, 0, sizeof(bh_point_geom));
     g.ordn = ordn;
+    g.bi = -1; // BH_OPT5: memset 归零后必须显式置 -1（0 是合法的副本下标）
 
     // 越界检查与 Interp_Points 一致（提前到预计算阶段做一次）
     for (int i = 0; i < dim; i++)
@@ -1225,11 +1271,11 @@ void Patch::prepare_point_geom(int NN, double **XX, int Symmetry,
     }
 
     // 块归属搜索（与 Interp_Points 相同的 llb/uub 判定）
-    MyList<Block> *Bp = blb;
+    // BH_OPT5: 改用 blks[] 数组遍历（内容与 MyList 顺序一致），以便记下块序号 t
     bool notfind = true;
-    while (notfind && Bp)
+    for (int t = 0; t < nb && notfind; t++)
     {
-      Block *BP = Bp->data;
+      Block *BP = blks[t];
       bool flag = true;
       for (int i = 0; i < dim; i++)
       {
@@ -1257,30 +1303,29 @@ void Patch::prepare_point_geom(int NN, double **XX, int Symmetry,
       {
         notfind = false;
         g.BP = BP;
+        g.bi = t; // BH_OPT5: 记下命中的块序号，下面取该块的 X 副本
       }
-      if (Bp == ble)
-        break;
-      Bp = Bp->next;
     }
     if (!g.BP)
       continue; // 运行时回退旧路径
-    // 块数据数组（X/fgfs）只在拥有该块的 rank 上分配；模板几何只需在
-    // 拥有者上计算——插值内核本来就只在 myrank == BP->rank 时执行。
-    if (g.BP->rank != myrank)
-      continue;
+    // BH_OPT5: 这里原有「if (g.BP->rank != myrank) continue;」——现已删除。
+    // 块数据副本每轮在计时区外广播给所有 rank，所以每个 rank 都要把几何算全。
+    // 下面用 Xc（广播来的 X 副本）代替 g.BP->X：后者只在拥有者 rank 上分配
+    // （见 Block.C 的 if (myrank == rank)）。shape 各 rank 都有，照旧用 g.BP->shape。
 
     // 等价 global_interp 的 cxI/cxB/cxT 计算与钳位（Fortran 1 基下标）
     for (int m = 0; m < 3; m++)
     {
-      const double dxm = g.BP->X[m][1] - g.BP->X[m][0];
+      const double *Xm = Xc[g.bi * dim + m];
+      const double dxm = Xm[1] - Xm[0];
       // Fortran idint 是向零截断，与 C 的 (int) 强转一致
-      const int cxi = (int)((XX[m][j] - g.BP->X[m][0]) / dxm + 0.4) + 1;
+      const int cxi = (int)((XX[m][j] - Xm[0]) / dxm + 0.4) + 1;
       int cxB = cxi - ordn / 2 + 1;
       int cxT = cxB + ordn - 1;
       int cmin = 1;
-      if (m == 2 && Symmetry != 0 && fabs(g.BP->X[m][0]) < dxm)
+      if (m == 2 && Symmetry != 0 && fabs(Xm[0]) < dxm)
         cmin = -ordn / 2 + 1; // 赤道对称：z 方向越界回折
-      if (m < 2 && Symmetry == 2 && fabs(g.BP->X[m][0]) < dxm)
+      if (m < 2 && Symmetry == 2 && fabs(Xm[0]) < dxm)
         cmin = -ordn / 2 + 1; // 八分对称：x/y 方向越界回折
       if (cxB < cmin)
       {
@@ -1296,9 +1341,9 @@ void Patch::prepare_point_geom(int NN, double **XX, int Symmetry,
       // 模板内分数坐标；cxB<=0 时坐标数组按反射延拓（见 global_interp 的 cx 计算）
       double cx;
       if (cxB > 0)
-        cx = (XX[m][j] - g.BP->X[m][cxB - 1]) / dxm;
+        cx = (XX[m][j] - Xm[cxB - 1]) / dxm;
       else
-        cx = (XX[m][j] + g.BP->X[m][1 - cxB - 1]) / dxm; // 镜像面在 X(1)，非 X(2)
+        cx = (XX[m][j] + Xm[1 - cxB - 1]) / dxm; // 镜像面在 X(1)，非 X(2)
       // 越界反射标记：1 基下标 fi = cxB+p < 1 的模板点取镜像 1-fi 并乘 SoA
       for (int p = 0; p < ordn; p++)
         g.refl[m][p] = (cxB + p < 1) ? 1 : 0;
@@ -1316,6 +1361,42 @@ void Patch::prepare_point_geom(int NN, double **XX, int Symmetry,
       }
     }
   }
+
+  // BH_OPT5: 建「含点块」的数据副本条目。只有被采样点穿过的块才需要副本
+  // （实测 8 块中只有 4 块），其数据在计时区外每轮由各自拥有者广播刷新
+  // （见 surface_integral::sync_block_copies）。这里只分配缓冲区。
+  {
+    int *t2bc = new int[nb];
+    for (int t = 0; t < nb; t++)
+      t2bc[t] = -1;
+    int nbc = 0;
+    for (int j = 0; j < NN; j++)
+      if (geom[j].bi >= 0 && t2bc[geom[j].bi] < 0)
+        t2bc[geom[j].bi] = nbc++;
+    *pn_bc = nbc;
+    *pbc = new bh_block_copy[nbc > 0 ? nbc : 1];
+    for (int t = 0; t < nb; t++)
+      if (t2bc[t] >= 0)
+      {
+        bh_block_copy &c = (*pbc)[t2bc[t]];
+        c.src = blks[t];
+        for (int m = 0; m < dim; m++)
+          c.shape[m] = blks[t]->shape[m];
+        const long sz = (long)c.shape[0] * c.shape[1] * c.shape[2];
+        for (int v = 0; v < 2; v++)
+          c.f[v] = new double[sz](); // 值初始化：首轮同步前不会被读到
+      }
+    // 把 geom[].bi 从「块序号」改写成「副本下标」
+    for (int j = 0; j < NN; j++)
+      if (geom[j].bi >= 0)
+        geom[j].bi = t2bc[geom[j].bi];
+    delete[] t2bc;
+  }
+
+  for (int t = 0; t < nb * dim; t++)
+    delete[] Xc[t];
+  delete[] Xc;
+  delete[] blks;
 }
 void Patch::Interp_Points(MyList<var> *VarList,
                           int NN, double **XX,

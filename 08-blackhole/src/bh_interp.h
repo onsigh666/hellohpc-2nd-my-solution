@@ -21,10 +21,24 @@
 struct bh_point_geom
 {
   const Block *BP;      // 拥有该点的网格块；NULL = 未找到（运行时回退旧搜索路径）
+  int bi;               // BH_OPT5: 该点所属块在副本数组里的下标（-1 = 无副本，走旧路径）
   int ordn;             // 每方向模板点数 = surface_interpolation_order()
   int base[3];          // 模板起点（1 基下标，等价 global_interp 的 cxB）
   double w[3][BH_ORDN_MAX];     // 各方向拉格朗日权重（节点 0..ordn-1 上取值）
   unsigned char refl[3][BH_ORDN_MAX]; // 该模板点是否越界反射（值需乘 var 的 SoA[d]）
+};
+
+// BH_OPT5: 含点块的数据副本。
+// 球面采样点只穿过少数几个块（实测 np=8 时是 8 块中的 4 块），而块固定归属某个
+// rank——于是 4 个 rank 满负荷插值、另外 4 个从头发呆到尾（见 bh_detector_cache
+// 的注释）。但场数据是每轮重新填充的、且填充发生在计时区外，所以只要在计时区外
+// 把「含点块」的数据抄一份给所有 rank，计时区内 8 个 rank 就都能插值。
+// 插值计算本身仍完整地在计时区内完成，只是数据来源换成了本地副本。
+struct bh_block_copy
+{
+  const Block *src;     // 源块（每轮从这里取最新数据；仅拥有者有效）
+  int shape[3];         // = src->shape
+  double *f[2];         // 两个变量（Rpsi4/Ipsi4）的数据副本，按 var 列表顺序
 };
 
 // 单个探测器（固定 rex）的缓存：采样点 + 每点插值几何 + 本 rank 负责的点列表
@@ -39,6 +53,10 @@ struct bh_detector_cache
   // 改成只遍历自己这份。
   int *mine;
   int n_mine;
+  // BH_OPT5: 含点块的数据副本（见 bh_block_copy）。每轮由 sync_block_copies
+  // 在计时区外刷新，使所有 rank 都能插值自己分到的那份点。
+  bh_block_copy *bc;
+  int n_bc;
 };
 
 // 融合张量积插值内核。

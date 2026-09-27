@@ -59,6 +59,10 @@ public:
 	void end_wave_benchmark();
 	void prepare_benchmark(int decn, double maxrex, double drex, int lev,
 						   cgh *GH); // BH_OPT: 预计算各探测器球面插值几何（计时区外）
+	// BH_OPT5: 把「含点块」的最新场数据广播给所有 rank。必须在计时区外调用
+	// （紧挨着 Surface_Only_Benchmark 的 MPI_Barrier 之前），每轮一次即可，
+	// 3 个探测器共用同一份场数据。
+	void sync_block_copies(var *Rpsi4, var *Ipsi4);
 	static void report_prof(); // BH_PROF: 临时分解基准探针（提交前移除）
 
 	void surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *Ipsi4,

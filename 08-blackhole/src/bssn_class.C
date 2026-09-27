@@ -938,6 +938,11 @@ void bssn_class::Surface_Only_Benchmark(int repeats, int warmup, bool include_ma
       }
       Pp = Pp->next;
     }
+    // BH_OPT5: 把「含点块」的最新场数据抄给所有 rank —— 必须在计时区外做。
+    // 场填充每个 rank 只填自己那块，而球面只穿过 8 块中的 4 块，于是另外 4 个
+    // rank 在计时区内无事可做、从头发呆到尾。抄一份数据（同节点走共享内存）
+    // 后就能把 25600 个采样点平摊给 8 个 rank。每轮一次即可，3 个探测器共用。
+    Waveshell->sync_block_copies(Rpsi4, Ipsi4);
     MPI_Barrier(MPI_COMM_WORLD);
     double iteration_time = MPI_Wtime();
     Waveshell->begin_wave_benchmark(a_lev, GH, Rpsi4, Ipsi4, field_epoch);
