@@ -1,0 +1,27 @@
+version: hellohpc/v0.4.0
+problem:
+  id: writeup
+  title: Writeup Submit
+workspace:
+  editable:
+    - 02-questions.md
+    - 03-accelerate.md
+    - 04-cheatsheet.md
+    - 05-miniclash.md
+    - 06-rune.md
+    - 07-maimoe.md
+    - 08-blackhole.md
+    - 09-mahjx.md
+    - 10-kernel.md
+    - 11-llm.md
+workflow:
+  matrix:
+    id: [writeup]
+    score: 100
+  result:
+    score:
+      uses: builtin/score-ratio
+      with:
+        value: 1
+        full-at: 1
+        zero-at: 2

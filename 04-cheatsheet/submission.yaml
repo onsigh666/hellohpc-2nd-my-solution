@@ -1,2 +1,2 @@
-operator: bitmatrix
-model: qwen3.8-27b
+operator: fft
+model: deepseek-reasoner

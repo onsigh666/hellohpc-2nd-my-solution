@@ -1,0 +1,36 @@
+# ============================================================
+# 根目录 .gitignore —— 告诉 git「哪些东西不要纳入版本控制」
+#
+# 规则写法：一行一条；不带 / 的名字，在任意子目录里都生效
+#   *.out        → 任何目录下以 .out 结尾的文件
+#   某个/目录/    → 末尾加 / 表示只匹配目录
+# ============================================================
+
+# --- 1. Windows 带出来的隐藏标记 ---
+# 从 Windows 下载/拷贝文件过来时，WSL 会附带生成一个叫
+# "xxx:Zone.Identifier" 的附属文件，里面只记录「此文件来自其他计算机」。
+# 在 Linux 下毫无用处，纯垃圾。
+*Zone.Identifier
+
+# --- 2. 跑出来的日志、打包好的提交包 ---
+# 这些是「运行产物」：随时能重新跑出来 / 重新打一次包。
+# 传上去只会让仓库越来越大，以后 clone 越来越慢。
+*.out
+*.zip
+
+# --- 3. 05-miniclash 的大块测试数据（合计约 3.6M）---
+# 官方给的二进制测试用例，本地用 utils/gencase.py 可以重新生成。
+05-miniclash/testcase/
+05-miniclash/testcase256/
+05-miniclash/testcase8/
+05-miniclash/testcase_gate3a/
+
+# --- 4. 外部下载的可执行文件 ---
+# md5fastcoll 是从网上拿来的现成工具，不是我们自己写的代码。
+05-miniclash/source_code/md5fastcoll
+
+# --- 5. 运行时用的配置软链接 ---
+# 08-blackhole/input.par 只是指向 configs/small.par 的一个快捷方式，
+# 真正的配置文件 configs/*.par 已经纳入版本控制了，换台机器重建即可：
+#   ln -s configs/small.par input.par
+08-blackhole/input.par

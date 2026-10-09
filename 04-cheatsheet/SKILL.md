@@ -1,17 +1,22 @@
 ---
 name: cpu-hpc-skill
-description: fft 内核优化手册：查表、SoA+SIMD、radix-4 三步改法；不到 2× 得 0 分。动手前先加载。
+description: fft optimization ladder - twiddles, cross-batch Stockham, radix-4.
 ---
 
-# fft 优化手册
+# fft optimization ladder
 
-计分只看加速比：快 2× 才开始得分，4× 满分，不到 2× 一律 0 分。前两步只到 1.7×，第 3 步是必做项：
+S<2 scores 0, S=4 is full marks. Climb one rung at a time.
 
-1. **位反转查表**：starter 每元素现算 log_n 次移位；预生成 `rev[]` 表，置换只查表。
-2. **旋转因子查表**：starter 蝶形里递推累乘；改成每层连续表 `w[j]=exp(-2πi·j/span)`。
-3. **SoA+向量化**：复数拆成 `re[]/im[]` 两条数组，蝶形 j 循环加 `#pragma omp simd`。三步做完约 2.4×，没到 2× 别停。
-4. 仍不够：radix-4（两层合并、访存减半）、按 batch 展开喂满向量单元。
+**Validate each rung with exactly `bash tools/test_candidate.sh`** - it builds, checks correctness and benchmarks in one call, printing `median_time_ms`.
 
-硬约束：单线程；不得运行时分配内存（用 static 数组，禁 vector/new）；禁外部 FFT 库。
+**Rung 1 - twiddle tables.** Precompute one contiguous `cos[]`/`sin[]` table per stage, and a `rev[]` table for bit reversal. (~1.7x)
 
-流程：每改一版 → `bash tools/check.sh`（须 `correctness: passed`）→ `bash tools/bench.sh` 读 `median_time_ms` → `bash tools/vec_report.sh` 确认向量化。
+**Rung 2 - SoA + vectorize.** Split complex into `re[]`/`im[]` so the butterfly auto-vectorizes. (~2.4x, first scoring rung)
+
+**Rung 3 - cross-batch layout + Stockham.** Vectorize across batches, not across butterflies. A call does 16/8 transforms, so lay out `re[i*8+l]` (i=index, l=batch): one row of 8 = 2 NEON vectors, 4 lanes share one twiddle, no shuffles. 8 lanes is the sweet spot (16 is slower, L1). Drop the separate bit-reversal pass - Stockham folds reordering into the stage addresses. Stage s, `h=2^(s-1)`, `j<N/(2h)`, `k<h`: `u=cur[j*h+k]`, `v=cur[j*h+k+N/2]`; `nxt[j*2*h+k]=u+w*v`, `nxt[j*2*h+k+h]=u-w*v`. Indices are rows. (~3.3x)
+
+**Rung 4 - radix-4.** Traps: output offsets 0,2g,g,3g (1,2 swapped); third branch's twiddle is `-i*w1`, not w3. (~3.5x, full marks)
+
+Rules: single-threaded; no runtime allocation (static arrays, no vector/new); no FFT libraries.
+
+If a rung fails correctness twice, write the last passing source back and stop.
